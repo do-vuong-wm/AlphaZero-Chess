@@ -1,5 +1,5 @@
 import os
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '1'
+# os.environ['TF_CPP_MIN_LOG_LEVEL'] = '1'
 import math
 import numpy as np
 from typing import List
@@ -145,9 +145,9 @@ class AlphaZeroConfig(object):
 
         ### Training
         self.training_steps = int(700e3)
-        self.checkpoint_interval = 2 # int(1e3)
-        self.window_size = int(1e5) # int(1e6) # buffer size
-        self.batch_size = 32*(self.num_actors-1) # 32 # 256 # 4096
+        self.checkpoint_interval = 5 # int(1e3)
+        self.window_size = int(1e2) # int(1e6) # buffer size
+        self.batch_size = 64*(self.num_actors-1) # 32 # 256 # 4096 # (Global.replay_buffer.move_total()//len(Global.replay_buffer.buffer))*(config.num_actors-1)
 
         self.weight_decay = 1e-4 # regularization param
         self.momentum = 0.9
@@ -228,7 +228,7 @@ class Game(object):
         else:
             temp_env = chess_env()
             temp_env.reset()
-            for i in range(state_index): # change from range(state_index+1) to range(state_index)
+            for i in range(state_index):
                 temp_env.step(self.history[i])
             observation, _, _, _ = temp_env.last()
             return self.observation['observation']
@@ -248,21 +248,40 @@ class ReplayBuffer(object):
         self.window_size = config.window_size
         self.batch_size = config.batch_size
         self.buffer = []
+        self.counter = 0
 
     def save_game(self, game):
         if len(self.buffer) > self.window_size:
             self.buffer.pop(0)
         self.buffer.append(game)
+        self.counter += 1
 
-    def sample_batch(self):
+    def sample_batch(self, size):
         # Sample uniformly across positions.
         move_sum = float(sum(len(g.history) for g in self.buffer))
         games = np.random.choice(
                 self.buffer,
-                size=self.batch_size,
+                size=size,
                 p=[len(g.history) / move_sum for g in self.buffer])
         game_pos = [(g, np.random.randint(len(g.history))) for g in games]
-        return [(g.make_image(i), g.make_target(i)) for (g, i) in game_pos]
+        image_batch = []
+        value_batch = []
+        policy_batch = []
+        for (g, i) in game_pos:
+            image_batch.append(g.make_image(i))
+            (target_value, target_policy) = g.make_target(i)
+            value_batch.append(target_value)
+            policy_batch.append(target_policy)
+        image_batch = np.asarray(image_batch, dtype=np.float32)
+        image_batch = np.reshape(image_batch, [-1, 8, 8, 20])
+        value_batch = np.asarray(value_batch, dtype=np.float32)
+        value_batch = np.reshape(value_batch, [-1, 1])
+        policy_batch = np.asarray(policy_batch, dtype=np.float32)
+        policy_batch = np.reshape(policy_batch, [-1, 4672])
+        return (image_batch, value_batch, policy_batch)
+
+    def move_total(self):
+        return sum(len(g.history) for g in self.buffer)
 
 """# Shared Storage
 Use for executing asynchronously in parallel.
@@ -415,11 +434,11 @@ def run_selfplay(config: AlphaZeroConfig, Global, Lock, pid):
     def play_game(config: AlphaZeroConfig, network: Network):
         game = Game()
         while not game.terminal() and len(game.history) < config.max_moves:
-            if not pid:
-                game.env.render()
             action, root = run_mcts(config, game, network) # MCTS runs 800 sims for each position til terminal
             game.apply(action)
             game.store_search_statistics(root) # search probabilities
+            if not pid:
+                game.env.render()
         return game
 
     """# Core Monte Carlo Tree Search algorithm.
@@ -487,10 +506,10 @@ def run_selfplay(config: AlphaZeroConfig, Global, Lock, pid):
         # Expand the node.
         node.to_play = game.to_play()
         legal_actions = game.legal_actions()
-        policy = {a: np.exp(policy_logits[a]) for a in legal_actions}
-        policy_sum = sum(policy.values())
-        for action, p in policy.items():
-            node.children[action] = Node(p / policy_sum)
+        policy = tf.nn.softmax([policy_logits[a] for a in legal_actions]).numpy()
+
+        for i in range(len(legal_actions)):
+            node.children[legal_actions[i]] = Node(policy[i])
         return float(value)
 
     # At the end of a simulation, we propagate the evaluation all the way up the
@@ -532,7 +551,7 @@ def run_selfplay(config: AlphaZeroConfig, Global, Lock, pid):
         temp.save_game(game) # to sync proxy object
         Global.replay_buffer = temp
         Lock.release()
-        print('Process %d: %d %d' % (pid, len(Global.storage._networks), len(Global.replay_buffer.buffer)))
+        print('Process %d: %d %d %d' % (pid, len(Global.storage._networks), len(Global.replay_buffer.buffer), Global.replay_buffer.move_total()))
 
 """# Training"""
 
@@ -623,19 +642,15 @@ def train_network(config: AlphaZeroConfig, Global):
 
     def update_weights(optimizer: tf.keras.optimizers.Optimizer, network: Network, batch,
                     weight_decay: float):
+        image_batch = batch[0]
+        value_batch = batch[1]
+        policy_batch = batch[2]
         with tf.GradientTape() as tape:
             loss = 0
-            for image, (target_value, target_policy) in batch:
-                image = tf.convert_to_tensor(image, dtype='float32')
-                value, policy_logits = network(tf.expand_dims(image, 0), training=True)
-                value = tf.squeeze(value, [0])
-                policy_logits = tf.squeeze(policy_logits, [0])
-                t = tf.convert_to_tensor(target_policy, dtype='float32')
-                v = tf.convert_to_tensor(target_value, dtype='float32')
-                loss += (
-                    tf.keras.metrics.mean_squared_error(v, value) +
-                    tf.nn.softmax_cross_entropy_with_logits(
-                        logits=policy_logits, labels=t))
+            mse = tf.keras.losses.MeanSquaredError(reduction='none')
+            value, policy_logits = network(image_batch, training=True)
+            loss += tf.reduce_sum(mse(value_batch, value) + 
+                    tf.nn.softmax_cross_entropy_with_logits(logits=policy_logits, labels=policy_batch))
 
             for weights in network.get_weights():
                 loss += weight_decay * tf.nn.l2_loss(weights)
@@ -646,22 +661,23 @@ def train_network(config: AlphaZeroConfig, Global):
     network(tf.ones((1, 8, 8, 20)))
 
     learning_rate_schedule = tf.keras.optimizers.schedules.PiecewiseConstantDecay(config.boundaries, config.values)
-    optimizer = tf.keras.optimizers.SGD(learning_rate_schedule, # Maybe other optimizers with no schedule?
+    optimizer = tf.keras.optimizers.SGD(learning_rate_schedule,
                                         config.momentum)
     i = 0
-    prev_size = 0
+    prev_counter = 0
     while True:
-        buffer_size = len(Global.replay_buffer.buffer)
-        if(not buffer_size % (config.num_actors-1) and buffer_size >= config.num_actors-1 and prev_size != buffer_size):
-            print('Next Batch Processing...')
-            batch = Global.replay_buffer.sample_batch()
+        counter = Global.replay_buffer.counter
+        if(not counter % (config.num_actors-1) and counter >= (config.num_actors-1) and prev_counter != counter):
+            batch_size = (Global.replay_buffer.move_total()//len(Global.replay_buffer.buffer))*(config.num_actors-1)
+            print('Next Batch Processing with size = ' + str(batch_size))
+            batch = Global.replay_buffer.sample_batch(batch_size)
             update_weights(optimizer, network, batch, config.weight_decay)
             if i % config.checkpoint_interval == 0:
                 network.save_weights('checkpoints/' + str(i))
             temp = Global.storage
-            temp.save_network(i, network.get_weights())
+            temp.save_network(config.training_steps, network.get_weights())
             Global.storage = temp
-            prev_size = buffer_size
+            prev_counter = counter
             i += 1
     temp = Global.storage
     temp.save_network(config.training_steps, network.get_weights())
